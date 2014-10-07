@@ -20,6 +20,7 @@ from acl import ACL
 
 from ryu.base import app_manager
 from ryu.controller import dpset
+from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3, ether
@@ -29,6 +30,10 @@ from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import vlan
 from ryu.lib.dpid import str_to_dpid
+from ryu.lib import  hub
+from operator import attrgetter
+
+
 
 HIGHEST_PRIORITY = 9099
 HIGH_PRIORITY = 9001 # Now that is what I call high
@@ -54,6 +59,14 @@ class Valve(app_manager.RyuApp):
         # NOTE: you can set up only the one querier.
         # when you called this method several times,
         # only the last one becomes effective.
+
+        #  start a thread for stats gethering
+        self.stats_event = hub.Event()
+        self.threads.append(hub.spawn(self.stats_loop))
+        self.datapaths = [];
+        self.statstimeout = 5
+
+
 
         # Setup logging
         handler = logging.StreamHandler()
@@ -332,6 +345,9 @@ class Valve(app_manager.RyuApp):
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
+        if dp not in self.datapaths:
+           self.datapaths.append(dp)
+
         # clear flow table
         self.clear_flows(dp)
 
@@ -411,3 +427,36 @@ class Valve(app_manager.RyuApp):
         self.logger.info("%s: [%s] querier:[%s] hosts:%s",
                          msg.get(ev.reason), ev.address, ev.src,
                          ev.dsts)
+
+    def send_port_stats_request(self, datapath):
+       ofp = datapath.ofproto
+       ofp_parser = datapath.ofproto_parser
+
+       req = ofp_parser.OFPPortStatsRequest(datapath, 0, ofp.OFPP_ANY)
+       datapath.send_msg(req)
+
+
+
+
+    def stats_loop(self):
+       while self.is_active:
+            self.stats_event.clear()
+            for datapath in self.datapaths:
+                self.logger.debug('Sending OFPPortStatsRequest to Datapath:%s',datapath.id)
+                self.send_port_stats_request(datapath)
+            self.stats_event.wait(timeout=self.statstimeout)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_stats_reply_handler(self, ev):
+        body = ev.msg.body
+        self.logger.info('datapath         port     '
+                         'rx-pkts  rx-bytes rx-error '
+                         'tx-pkts  tx-bytes tx-error')
+        self.logger.info('---------------- -------- '
+                         '-------- -------- -------- '
+                         '-------- -------- --------')
+        for stat in sorted(body, key=attrgetter('port_no')):
+            self.logger.info('%016x %8x %8d %8d %8d %8d %8d %8d',
+                             ev.msg.datapath.id, stat.port_no,
+                             stat.rx_packets, stat.rx_bytes, stat.rx_errors,
+                             stat.tx_packets, stat.tx_bytes, stat.tx_errors)
